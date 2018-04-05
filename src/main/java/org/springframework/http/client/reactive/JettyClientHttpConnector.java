@@ -40,11 +40,6 @@ public class JettyClientHttpConnector implements ClientHttpConnector {
 	@Override
 	public Mono<ClientHttpResponse> connect(HttpMethod method, URI uri,
 			Function<? super ClientHttpRequest, Mono<Void>> requestCallback) {
-
-		if (!uri.isAbsolute()) {
-			return Mono.error(new IllegalArgumentException("URI is not absolute: " + uri));
-		}
-
 		if (!httpClient.isStarted()) {
 			try {
 				this.httpClient.start();
@@ -53,7 +48,12 @@ public class JettyClientHttpConnector implements ClientHttpConnector {
 				return Mono.error(ex);
 			}
 		}
-		org.springframework.http.client.reactive.JettyClientHttpRequest clientHttpRequest =
+
+		if (!uri.isAbsolute()) {
+			return Mono.error(new IllegalArgumentException("URI is not absolute: " + uri));
+		}
+
+		JettyClientHttpRequest clientHttpRequest =
 				new JettyClientHttpRequest(httpClient.newRequest(uri).method(method.toString()));
 		return requestCallback.apply(clientHttpRequest).then(clientHttpRequest.getResponse());
 	}

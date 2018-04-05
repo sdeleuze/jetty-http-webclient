@@ -15,21 +15,29 @@
  */
 package org.springframework.http.client.reactive;
 
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpCookie;
 import java.net.URI;
+import java.nio.ByteBuffer;
 import java.util.Collection;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.IntPredicate;
 
 import org.eclipse.jetty.client.api.Request;
 import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.reactive.client.ContentChunk;
 import org.eclipse.jetty.reactive.client.ReactiveRequest;
+import org.eclipse.jetty.util.Callback;
 import org.reactivestreams.Publisher;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferFactory;
+import org.springframework.core.io.buffer.DefaultDataBuffer;
 import org.springframework.core.io.buffer.DefaultDataBufferFactory;
+import org.springframework.core.io.buffer.PooledDataBuffer;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.MediaType;
@@ -46,12 +54,12 @@ public class JettyClientHttpRequest extends AbstractClientHttpRequest {
 
 	private final Request jettyRequest;
 
-	// TODO Check with Arjen what is relevant here
-	private final DataBufferFactory bufferFactory = new DefaultDataBufferFactory();
+	private final DefaultDataBufferFactory bufferFactory = new DefaultDataBufferFactory();
 
 	private ReactiveRequest reactiveRequest;
 
 	private Mono<ClientHttpResponse> response;
+
 
 	public JettyClientHttpRequest(Request jettyRequest) {
 		this.jettyRequest = jettyRequest;
@@ -97,20 +105,8 @@ public class JettyClientHttpRequest extends AbstractClientHttpRequest {
 		ReactiveRequest.Content requestContent =
 				ReactiveRequest.Content.fromPublisher(Flux.from(publisher).map(DataBuffer::asByteBuffer).map(ContentChunk::new),
 						contentType);
-		ReactiveRequest reactiveRequest =
-				ReactiveRequest.newBuilder(jettyRequest).content(requestContent).build();
-		return doCommit(() -> {
-			this.response =
-					Mono.from(reactiveRequest.response((reactiveResponse, responseContent) ->
-							Mono.just(new
-									JettyClientHttpResponse(reactiveResponse,
-									Flux.from(responseContent).map(chunk -> {
-										DataBuffer dataBuffer = bufferFactory.wrap(chunk.buffer);
-										chunk.callback.succeeded();
-										return dataBuffer;
-									})))));
-			return Mono.empty();
-		});
+		this.reactiveRequest = ReactiveRequest.newBuilder(jettyRequest).content(requestContent).build();
+		return doCommit(this::completes);
 	}
 
 	@Override
@@ -135,12 +131,19 @@ public class JettyClientHttpRequest extends AbstractClientHttpRequest {
 	private Mono<Void> completes() {
 		this.response = Mono.from(
 				this.reactiveRequest.response((reactiveResponse, contentChunks) -> {
-				Flux<DataBuffer> content = Flux.from(contentChunks).map(chunk -> {
-					DataBuffer dataBuffer = this.bufferFactory.wrap(chunk.buffer);
-					chunk.callback.succeeded();
-					return dataBuffer;
-				});
-				return Mono.just(new JettyClientHttpResponse(reactiveResponse, content));
+
+					// Implementation 1:  optimized wrapping + late release (fails maybe because we join all the buffer with DataBufferUtils.join before calling callback.succeeded())
+					Flux<DataBuffer> content = Flux.from(contentChunks).map(chunk -> new JettyClientDataBuffer(this.bufferFactory, chunk));
+
+					// Implementation 2: buffer copy (works)
+					//Flux<DataBuffer> content = Flux.from(contentChunks).map(chunk -> {
+					//	DataBuffer buffer = this.bufferFactory.allocateBuffer(chunk.buffer.capacity());
+					//	buffer.write(chunk.buffer);
+					//	chunk.callback.succeeded();
+					//	return buffer;
+					//});
+
+					return Mono.just(new JettyClientHttpResponse(reactiveResponse, content));
 			}));
 		return Mono.empty();
 	}
@@ -148,4 +151,171 @@ public class JettyClientHttpRequest extends AbstractClientHttpRequest {
 	public Mono<ClientHttpResponse> getResponse() {
 		return this.response;
 	}
+
+
+	public static class JettyClientDataBuffer implements PooledDataBuffer {
+
+		private final AtomicInteger counter = new AtomicInteger(1);
+
+		private final DefaultDataBuffer buffer;
+
+		private final Callback callback;
+
+		private final DefaultDataBufferFactory dataBufferFactory;
+
+
+		JettyClientDataBuffer(DefaultDataBufferFactory dataBufferFactory, ContentChunk chunk) {
+			Assert.notNull(dataBufferFactory, "'dataBufferFactory' must not be null");
+			Assert.notNull(chunk, "'chunk' must not be null");
+			this.dataBufferFactory = dataBufferFactory;
+			this.callback = chunk.callback;
+			this.buffer = dataBufferFactory.wrap(chunk.buffer);
+		}
+
+		@Override
+		public DataBufferFactory factory() {
+			return this.dataBufferFactory;
+		}
+
+		@Override
+		public int indexOf(IntPredicate predicate, int fromIndex) {
+			return this.buffer.indexOf(predicate, fromIndex);
+		}
+
+		@Override
+		public int lastIndexOf(IntPredicate predicate, int fromIndex) {
+			return this.buffer.lastIndexOf(predicate, fromIndex);
+		}
+
+		@Override
+		public int readableByteCount() {
+			return this.buffer.readableByteCount();
+		}
+
+		@Override
+		public int writableByteCount() {
+			return this.buffer.writableByteCount();
+		}
+
+		@Override
+		public int capacity() {
+			return this.buffer.capacity();
+		}
+
+		@Override
+		public DataBuffer capacity(int capacity) {
+			return this.buffer.capacity(capacity);
+		}
+
+		@Override
+		public int readPosition() {
+			return this.buffer.readPosition();
+		}
+
+		@Override
+		public DataBuffer readPosition(int readPosition) {
+			return this.buffer.readPosition(readPosition);
+		}
+
+		@Override
+		public int writePosition() {
+			return this.buffer.writePosition();
+		}
+
+		@Override
+		public DataBuffer writePosition(int writePosition) {
+			return this.buffer.writePosition(writePosition);
+		}
+
+		@Override
+		public byte getByte(int index) {
+			return this.buffer.getByte(index);
+		}
+
+		@Override
+		public byte read() {
+			return this.buffer.read();
+		}
+
+		@Override
+		public DataBuffer read(byte[] destination) {
+			return this.buffer.read(destination);
+		}
+
+		@Override
+		public DataBuffer read(byte[] destination, int offset, int length) {
+			return this.buffer.read(destination, offset, length);
+		}
+
+		@Override
+		public DataBuffer write(byte b) {
+			return this.buffer.write(b);
+		}
+
+		@Override
+		public DataBuffer write(byte[] source) {
+			return this.buffer.write(source);
+		}
+
+		@Override
+		public DataBuffer write(byte[] source, int offset, int length) {
+			return this.buffer.write(source, offset, length);
+		}
+
+		@Override
+		public DataBuffer write(DataBuffer... buffers) {
+			return this.buffer.write(buffers);
+		}
+
+		@Override
+		public DataBuffer write(ByteBuffer... buffers) {
+			return this.buffer.write(buffers);
+		}
+
+		@Override
+		public DataBuffer slice(int index, int length) {
+			return this.buffer.slice(index, length);
+		}
+
+		@Override
+		public ByteBuffer asByteBuffer() {
+			return this.buffer.asByteBuffer();
+		}
+
+		@Override
+		public ByteBuffer asByteBuffer(int index, int length) {
+			return this.buffer.asByteBuffer(index, length);
+		}
+
+		@Override
+		public InputStream asInputStream() {
+			return this.buffer.asInputStream();
+		}
+
+		@Override
+		public InputStream asInputStream(boolean releaseOnClose) {
+			return this.buffer.asInputStream(releaseOnClose);
+		}
+
+		@Override
+		public OutputStream asOutputStream() {
+			return this.buffer.asOutputStream();
+		}
+
+		@Override
+		public PooledDataBuffer retain() {
+			this.counter.incrementAndGet();
+			return this;
+		}
+
+		@Override
+		public boolean release() {
+			if (this.counter.decrementAndGet() == 0) {
+				this.callback.succeeded();
+				return true;
+			}
+			return false;
+		}
+	}
+
 }
